@@ -17,6 +17,7 @@ from urllib.parse import urljoin
 import requests
 from requests import Session
 import re
+from urllib3.util import Retry
 
 # Get log file path from environment or use default
 log_file = os.getenv('LOG_FILE', 'myfans_downloader.log')
@@ -105,16 +106,36 @@ def safe_urljoin(base: str, url: str) -> str:
         raise ValueError("Base URL and URL parts must not be None")
     return urljoin(base, url)
 
-def make_request(session: requests.Session, url: str, headers: dict, timeout: int = 30) -> requests.Response:
-    """Make a request ensuring proper type safety"""
+def make_request(session: requests.Session, url: str, headers: dict, timeout: int = 30, max_retries: int = 5) -> requests.Response:
+    """Make a request with automatic retry for connection resets"""
     if not url:
         raise ValueError("URL cannot be None")
-    return session.get(url, headers=headers, timeout=timeout)
+    
+    retry_count = 0
+    while retry_count < max_retries:
+        try:
+            return session.get(url, headers=headers, timeout=timeout)
+        except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as e:
+            retry_count += 1
+            wait_time = min(2 ** retry_count, 60)  # Exponential backoff, max 60s
+            logger.warning(f"Connection error on attempt {retry_count}/{max_retries}: {str(e)}")
+            logger.info(f"Waiting {wait_time}s before retry...")
+            time.sleep(wait_time)
+            
+            # Erstelle eine neue Session nach einem Verbindungsabbruch
+            if retry_count >= 3:
+                logger.info("Creating new session after connection failures")
+                session = requests.Session()
+                session.headers.update(headers)
+                
+            if retry_count == max_retries:
+                logger.error(f"Max retries reached for URL: {url}")
+                raise
 
-def DL_File(m3u8_url_download, output_file, input_post_id, chunk_size=1024*1024, max_retries=3, retry_delay=5, progress_queue=None, download_state=None):
+def DL_File(m3u8_url_download, output_file, input_post_id, max_retries=3, retry_delay=5, progress_queue=None, download_state=None):
     try:
         # Get segment download threads from environment or use default
-        segment_threads = int(os.getenv('SEGMENT_DOWNLOAD_THREADS', '15'))
+        segment_threads = int(os.getenv('SEGMENT_DOWNLOAD_THREADS', '20'))
         logger.info(f"Using {segment_threads} threads for segment downloads")
         
         # Add M3U8 URL validation
@@ -147,17 +168,25 @@ def DL_File(m3u8_url_download, output_file, input_post_id, chunk_size=1024*1024,
         os.makedirs(output_folder, exist_ok=True)
         os.makedirs(temp_folder, exist_ok=True)
 
-        # Setup session with headers
+        # Setup session with headers and retry mechanism
         headers = read_headers_from_file("header.txt")
         session = requests.Session()
         session.headers.update(headers)
         
         # Use connection pooling for better performance
-        adapter = requests.adapters.HTTPAdapter(pool_connections=segment_threads, 
-                                               pool_maxsize=segment_threads,
-                                               max_retries=max_retries)
+        adapter = requests.adapters.HTTPAdapter(
+            pool_connections=segment_threads,
+            pool_maxsize=segment_threads,
+            max_retries=Retry(
+                total=5,
+                backoff_factor=0.5,
+                status_forcelist=[500, 502, 503, 504],
+                allowed_methods=["GET", "HEAD"]
+            )
+        )
         session.mount('http://', adapter)
         session.mount('https://', adapter)
+
 
         for attempt in range(max_retries):
             try:
@@ -1129,40 +1158,22 @@ def check_existing_files(filtered_posts: List[Dict], output_dir: str, filename_c
         post_id = post.get('id')
         if not post_id:
             continue
-            
-        # Get post date
-        post_date = post.get('posted_at', '').split('T')[0] if post.get('posted_at') else 'unknown_date'
         
         # Get username
         username = post.get('user', {}).get('username', 'unknown')
-        
-        # Generate possible filenames (both old and new patterns)
-        possible_filenames = [
-            # New pattern with post ID
-            generate_filename(post, filename_config, output_dir),
-            # Old pattern with {title}
-            f"{username}_{post_date}_{{title}}.mp4",
-            f"{username}_{post_date}_{{title}}_1.mp4"  # For split videos
-        ]
-        
         output_folder = os.path.join(output_dir, username, "videos")
         
-        # Check if any of the possible filenames exist
+        # Einfach prüfen, ob irgendeine Datei im Ordner den post_id enthält
         found_valid_file = False
-        for filename in possible_filenames:
-            full_path = os.path.join(output_folder, filename)
-            if os.path.exists(full_path) and os.path.getsize(full_path) > 0:
-                if verify_video_file(full_path):
-                    existing_files.append(post_id)
-                    logger.info(f"Found existing verified file: {filename}")
-                    found_valid_file = True
-                    break
-                else:
-                    logger.warning(f"Found corrupted file, will redownload: {filename}")
-                    try:
-                        os.remove(full_path)
-                    except OSError as e:
-                        logger.error(f"Error removing corrupted file: {e}")
+        if os.path.exists(output_folder):
+            for filename in os.listdir(output_folder):
+                if post_id in filename and filename.endswith('.mp4'):
+                    full_path = os.path.join(output_folder, filename)
+                    if os.path.getsize(full_path) > 0 and verify_video_file(full_path):
+                        existing_files.append(post_id)
+                        logger.info(f"Found existing verified file for post ID {post_id}: {filename}")
+                        found_valid_file = True
+                        break
         
         if not found_valid_file:
             missing_files.append(post_id)
@@ -1174,34 +1185,40 @@ def generate_filename(post: Dict, filename_config: Dict, output_dir: str) -> str
     username = post.get('user', {}).get('username', 'unknown')
     post_id = post.get('id', 'unknown')
     
-    # Debug-Ausgabe der verfügbaren Datums-Felder
-    date_fields = [field for field in post.keys() if 'date' in field.lower() or 'time' in field.lower() or 'at' in field.lower()]
-    logger.debug(f"Available date fields for post {post_id}: {date_fields}")
+    # Direkter Zugriff auf die wichtigsten Felder und Logging des vollständigen post-Objekts
+    logger.debug(f"Post data for filename generation: {json.dumps(post, default=str)[:2000]}...")
+
+    # Debug: Zeige die verfügbaren Felder im Post
+    logger.debug(f"Post fields: {list(post.keys())}")
+
+    # Debug: Zeige den Inhalt bestimmter Felder
+    if 'posted_at' in post:
+        logger.debug(f"posted_at: {post['posted_at']}")
+    if 'created_at' in post:
+        logger.debug(f"created_at: {post['created_at']}")
     
-    # Explizite Prüfung jedes möglichen Datumsfeldes
+    # Extrahiere das Datum - versuche verschiedene Felder
     post_date = None
     
-    # Prüfe posted_at
-    if post.get('posted_at') and isinstance(post.get('posted_at'), str):
+    # 1. Prüfe posted_at
+    if post.get('posted_at'):
         try:
-            date_part = post.get('posted_at').split('T')[0]
-            if len(date_part) == 10 and date_part.count('-') == 2:  # YYYY-MM-DD format
-                post_date = date_part
-                logger.info(f"Using posted_at date: {post_date} for post {post_id}")
-        except (IndexError, AttributeError):
-            pass
+            if isinstance(post.get('posted_at'), str) and 'T' in post.get('posted_at'):
+                post_date = post.get('posted_at').split('T')[0]
+                logger.info(f"Found date in posted_at: {post_date}")
+        except Exception as e:
+            logger.error(f"Error parsing posted_at: {e}")
     
-    # Prüfe created_at falls posted_at nicht funktioniert hat
-    if not post_date and post.get('created_at') and isinstance(post.get('created_at'), str):
+    # 2. Prüfe created_at
+    if not post_date and post.get('created_at'):
         try:
-            date_part = post.get('created_at').split('T')[0]
-            if len(date_part) == 10 and date_part.count('-') == 2:
-                post_date = date_part
-                logger.info(f"Using created_at date: {post_date} for post {post_id}")
-        except (IndexError, AttributeError):
-            pass
+            if isinstance(post.get('created_at'), str) and 'T' in post.get('created_at'):
+                post_date = post.get('created_at').split('T')[0]
+                logger.info(f"Found date in created_at: {post_date}")
+        except Exception as e:
+            logger.error(f"Error parsing created_at: {e}")
     
-    # Prüfe timestamp falls auch created_at nicht funktioniert hat
+    # 3. Prüfe timestamp
     if not post_date and post.get('timestamp'):
         try:
             from datetime import datetime
@@ -1209,44 +1226,46 @@ def generate_filename(post: Dict, filename_config: Dict, output_dir: str) -> str
             if isinstance(timestamp, (int, float)):
                 date_obj = datetime.fromtimestamp(timestamp)
                 post_date = date_obj.strftime('%Y-%m-%d')
-                logger.info(f"Using timestamp date: {post_date} for post {post_id}")
+                logger.info(f"Found date in timestamp: {post_date}")
         except Exception as e:
-            logger.error(f"Failed to parse timestamp for post {post_id}: {e}")
+            logger.error(f"Error parsing timestamp: {e}")
     
-    # Fallback auf "unknown_date" wenn gar nichts funktioniert
+    # 4. Prüfe published_at
+    if not post_date and post.get('published_at'):
+        try:
+            if isinstance(post.get('published_at'), str) and 'T' in post.get('published_at'):
+                post_date = post.get('published_at').split('T')[0]
+                logger.info(f"Found date in published_at: {post_date}")
+        except Exception as e:
+            logger.error(f"Error parsing published_at: {e}")
+    
+    # 5. Notfall: aktuelle Zeit verwenden statt unknown_date
     if not post_date:
-        post_date = "unknown_date"
-        logger.warning(f"No date found for post {post_id}, dumping post data for debug")
-        # Log first 500 chars of post data for debugging
-        logger.debug(f"Post data excerpt: {str(post)[:500]}...")
+        from datetime import datetime
+        post_date = datetime.now().strftime('%Y-%m-%d')
+        logger.warning(f"No date found in post data, using current date: {post_date}")
     
     # Get title or use part of post ID
     title = post.get('title', '')
     if not title or title.strip() == '':
-        title = post_id[:8]  # Use first 8 chars of post ID as title
-        
-    # Clean the title
-    title = clean_filename(title)
+        title = ""  # Kein Titel - nur ID verwenden
+    else:
+        title = clean_filename(title)
     
-    # Get separator
-    separator = filename_config.get('separator', '_')
-    
-    # Generate filename based on pattern
+    # Stelle sicher, dass die vollständige Post-ID im Dateinamen enthalten ist
     pattern = filename_config.get('pattern', '{creator}_{date}_{id}')
+    if '{id}' not in pattern:
+        pattern += '_{id}'  # Füge ID hinzu, wenn nicht im Pattern
+    
     filename = pattern.replace('{creator}', username) \
                      .replace('{date}', post_date) \
                      .replace('{title}', title) \
                      .replace('{id}', post_id)
     
-    # Entferne doppelte post_id im Dateinamen (wenn vorhanden)
-    base_name = os.path.splitext(filename)[0]
-    if base_name.endswith(f"_{post_id}") and f"_{post_id}" in base_name[:-len(post_id)-1]:
-        filename = base_name[:-len(post_id)-1] + ".mp4"
-    
-    # Ensure extension
+    # Stelle sicher, dass die Erweiterung korrekt ist
     if not filename.endswith('.mp4'):
         filename += '.mp4'
-        
+    
     logger.info(f"Generated filename for post {post_id}: {filename}")
     return filename
 
